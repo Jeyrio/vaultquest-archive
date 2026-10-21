@@ -1,4 +1,7 @@
 import { SearchIndexRepairService } from "./services/search/searchIndexRepairService.js";
+import type { CacheService } from "./services/cacheService.js";
+import cron from "node-cron";
+import type { ScheduledTask } from "node-cron";
 import cron, { type ScheduledTask } from "node-cron";
 import { randomUUID } from "node:crypto";
 import type { PrismaClient } from "@prisma/client";
@@ -13,6 +16,7 @@ import type { LedgerService } from "./services/ledger.js";
 import { LeaseService } from "./services/leaseService.js";
 import { getPrometheusMetrics } from "./services/prometheusMetrics.js";
 import { runReplayEquivalence } from "./services/replayEquivalence.js";
+import { INDEXER_JOB_LEASE } from "./services/projectionRebuild.js";
 import {
   OnChainDriftDetector,
   type OnChainReader,
@@ -244,6 +248,8 @@ export function startIndexerCron(opts: {
   logger: Logger;
   schedule?: string;
   indexerVersion?: string;
+  /** #989: true while a projection rebuild is incomplete; ingestion must not write on a half-built projection. */
+  isFenced?: () => Promise<boolean>;
 }): ScheduledTask {
   const schedule = opts.schedule ?? "*/1 * * * *";
   const leases = new LeaseService(opts.prisma);
@@ -253,10 +259,14 @@ export function startIndexerCron(opts: {
     try {
       await withJobLease(
         leases,
-        "stellar-indexer",
+        INDEXER_JOB_LEASE,
         leaseTtlMs,
         opts.logger,
         async () => {
+          if (await opts.isFenced?.()) {
+            opts.logger.warn({}, "indexer tick skipped: a projection rebuild is incomplete");
+            return;
+          }
           if (!(await pingDatabase(opts.prisma))) {
             opts.logger.warn({}, "indexer tick skipped: database unreachable");
             return;
@@ -455,6 +465,8 @@ export function startReplayEquivalenceCron(opts: {
   factoryAddress?: string;
   logger: Logger;
   schedule?: string;
+  /** #989: a partially rebuilt projection would page as a false divergence. */
+  isFenced?: () => Promise<boolean>;
 }): ScheduledTask {
   const schedule = opts.schedule ?? "30 3 * * *"; // default: daily at 03:30
   const leases = new LeaseService(opts.prisma);
@@ -469,6 +481,10 @@ export function startReplayEquivalenceCron(opts: {
         leaseTtlMs,
         opts.logger,
         async () => {
+          if (await opts.isFenced?.()) {
+            opts.logger.warn({}, "replay-equivalence skipped: a projection rebuild is incomplete");
+            return;
+          }
           const report = await runReplayEquivalence(
             opts.prisma,
             opts.replayPrisma,
@@ -651,45 +667,71 @@ export function startDataRetentionCron(opts: {
  * Compares primary records in the database with the discovery search index and repairs
  * missing, stale, orphaned, and visibility-mismatched entries.
  *
- * Runs hourly by default, guarded by a job lease to prevent concurrent ticks across replicas.
+ * Runs hourly by default on each replica because the search index is process-local.
  */
 export function startSearchIndexRepairCron(opts: {
-  prisma: PrismaClient;
   repairService: SearchIndexRepairService;
   logger: Logger;
   schedule?: string;
+}): cron.ScheduledTask {
   leaseTtlMs?: number;
 }): ScheduledTask {
   const schedule = opts.schedule ?? "0 * * * *"; // default: hourly
-  const leases = new LeaseService(opts.prisma);
-  const leaseTtlMs = opts.leaseTtlMs ?? 15 * 60 * 1000; // 15 minutes
 
   const task = cron.schedule(schedule, async () => {
     try {
-      await withJobLease(
-        leases,
-        "search-index-repair",
-        leaseTtlMs,
-        opts.logger,
-        async () => {
-          opts.logger.info("starting scheduled search index repair audit");
-          const report = await opts.repairService.runRepair();
-          opts.logger.info(
-            {
-              event: "search_index_repair.sweep_complete",
-              scannedSources: report.scannedSources,
-              scannedIndexEntries: report.scannedIndexEntries,
-              repairedCount: report.repairedCount,
-              anomalies: report.anomaliesDetected,
-              durationMs: report.durationMs,
-            },
-            `search index repair audit complete: repaired ${report.repairedCount} anomalies in ${report.durationMs}ms`,
-          );
+      // SearchIndexService is process-local memory. Every replica must refresh
+      // its own index; a distributed lease would leave non-holder replicas stale.
+      opts.logger.info("starting scheduled search index repair audit");
+      const report = await opts.repairService.runRepair();
+      opts.logger.info(
+        {
+          event: "search_index_repair.sweep_complete",
+          scannedSources: report.scannedSources,
+          scannedIndexEntries: report.scannedIndexEntries,
+          repairedCount: report.repairedCount,
+          anomalies: report.anomaliesDetected,
+          durationMs: report.durationMs,
         },
+        `search index repair audit complete: repaired ${report.repairedCount} anomalies in ${report.durationMs}ms`,
       );
     } catch (err) {
       opts.logger.error({ err }, "search index repair audit tick failed");
     }
   });
   return task;
+}
+
+/**
+ * Repairs bounded cache pages on every process: local LRU entries are
+ * process-specific, while shared Redis invalidation is idempotent.
+ */
+export function startCacheRepairCron(opts: {
+  cacheService: CacheService;
+  logger: Logger;
+  schedule?: string;
+  limit?: number;
+}): ScheduledTask {
+  const schedule = opts.schedule ?? "*/5 * * * *";
+  const limit = opts.limit ?? 100;
+  return cron.schedule(schedule, async () => {
+    try {
+      const result = await opts.cacheService.repairStaleCache({
+        dryRun: false,
+        limit,
+        auditNoop: false,
+      });
+      opts.logger.info(
+        {
+          event: "cache_repair.sweep_complete",
+          scanned: result.scanned,
+          repaired: result.repaired.length,
+          failed: result.failed.length,
+        },
+        "cache repair sweep complete",
+      );
+    } catch (err) {
+      opts.logger.error({ err }, "cache repair sweep failed");
+    }
+  });
 }

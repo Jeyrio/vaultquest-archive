@@ -22,6 +22,11 @@ import { usersRoutes } from "./routes/users.js";
 import { prometheusRoutes } from "./routes/prometheus.js";
 import { healthRoutes } from "./routes/health.js";
 import type { DegradedModeService } from "./services/degradedModeService.js";
+import { DegradedModeService } from "./services/degradedModeService.js";
+import {
+  DependencyMatrixValidator,
+  validateDependencyMatrixOnStartup,
+} from "./services/dependencyMatrixValidator.js";
 import { MetricsService } from "./services/metricsService.js";
 import { DrawProofService } from "./services/drawProofService.js";
 import { FEATURE_FLAGS, FeatureFlagService } from "./services/featureFlagService.js";
@@ -43,6 +48,7 @@ import type { CacheService } from "./services/cacheService.js";
 import { walletAuthRoutes } from "./routes/walletAuth.js";
 import { WalletAuthService } from "./services/walletAuth.js";
 import { requirePermission, walletSessionResolver } from "./middleware/rbac.js";
+import { requireMaintainerApproval } from "./middleware/maintainerApproval.js";
 import { transactionMetricsRoutes } from "./routes/transactionMetrics.js";
 import { CategoryService } from "./services/categoryService.js";
 import { categoriesRoutes } from "./routes/categories.js";
@@ -80,6 +86,7 @@ import {
 } from "./services/resumableRepairJob.js";
 import { PartialFailureService } from "./services/partialFailureService.js";
 import { partialFailureRoutes } from "./routes/partialFailures.js";
+import { cacheRepairRoutes } from "./routes/cacheRepair.js";
 import { policyDryRunRoutes } from "./routes/policyDryRun.js";
 import { SecurityRevocationService } from "./services/securityRevocationService.js";
 import { securityRevocationRoutes } from "./routes/securityRevocation.js";
@@ -132,6 +139,18 @@ import {
   type WebhookEventStore,
 } from "./services/webhookService.js";
 import { webhooksRoutes, type WebhookHandlerHooks } from "./routes/webhooks.js";
+import { LeaseService } from "./services/leaseService.js";
+import { sorobanNativeXdrDecoder } from "./services/stellarIndexer.js";
+import {
+  LeaseIndexerFence,
+  PrismaProjectionRebuildStore,
+  PrismaProjectionTarget,
+  ProjectionRebuildService,
+} from "./services/projectionRebuild.js";
+import { projectionRebuildRoutes } from "./routes/projectionRebuilds.js";
+import { MaintainerNotesService } from "./services/maintainerNotes.js";
+import { FailureEscalationService } from "./services/failureEscalation.js";
+import { maintainerOperationsRoutes, startMaintainerOperations } from "./routes/maintainerOperations.js";
 
 export type AppDeps = {
   prisma: PrismaClient;
@@ -154,12 +173,16 @@ export type AppDeps = {
   jobWorkerPollIntervalMs?: number;
   /** Comma-separated Soroban RPC endpoints used by dependency diagnostics. */
   sorobanRpcUrls?: string;
+  searchIndexService?: SearchIndexService;
+  searchIndexRepairService?: SearchIndexRepairService;
   degradedModeService?: DegradedModeService;
   jobQueue?: JobQueue;
   capabilityTokenService?: CapabilityTokenService;
   capabilityTokenSecret?: string;
   capabilityTokenStore?: CapabilityTokenStore;
   resumableRepairEngine?: ResumableRepairEngine;
+  /** #989: the live indexer's VAULT_FACTORY_ADDRESS, so a projection rebuild replays registry events identically. */
+  vaultFactoryAddress?: string;
 };
 
 declare module "fastify" {
@@ -191,6 +214,12 @@ export function buildApp(deps: AppDeps): FastifyInstance {
       "sensitive access anomaly",
     );
   });
+
+  // Initialize DegradedModeService if not provided
+  if (!deps.degradedModeService) {
+    deps.degradedModeService = new DegradedModeService();
+  }
+
   const app = Fastify({
     // Fastify 5 passes logger instances via `loggerInstance`; `logger` only
     // accepts a configuration object (FSTDEP / fastify@5 breaking change).
@@ -311,9 +340,9 @@ export function buildApp(deps: AppDeps): FastifyInstance {
   const schemaVersionSvc = new SchemaVersionService(deps.prisma);
   const auditSvc = new AuditService(deps.prisma);
 
-  const jobQueue = deps.jobQueue || (deps.jobStore
-    ? new JobQueue({ store: deps.jobStore })
-    : undefined);
+  const jobQueue =
+    deps.jobQueue ||
+    (deps.jobStore ? new JobQueue({ store: deps.jobStore }) : undefined);
   if (jobQueue) {
     const worker = new JobWorker({
       queue: jobQueue,
@@ -368,7 +397,9 @@ export function buildApp(deps: AppDeps): FastifyInstance {
   // #815: counters live in Redis when available so every replica enforces
   // the same limits; otherwise per process.
   const redisForLimits = deps.cacheService?.redisClient as unknown as
-    RedisLikeClient | null | undefined;
+    | RedisLikeClient
+    | null
+    | undefined;
   const operationLimits = new OperationLimitService({
     policies: resolveOperationPolicies(deps.operationLimits),
     counters: redisForLimits
@@ -448,12 +479,23 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     }),
   );
   app.register(walletAuthRoutes(walletAuthSvc));
-  app.register(healthRoutes(svc, {
-    prisma: deps.prisma,
-    cacheService: deps.cacheService,
-    rpcUrls: deps.sorobanRpcUrls,
-  }, deps.degradedModeService));
-  app.register(savedPoolsRoutes(savedPoolsSvc));
+  app.register(
+    healthRoutes(
+      svc,
+      {
+        prisma: deps.prisma,
+        cacheService: deps.cacheService,
+        rpcUrls: deps.sorobanRpcUrls,
+      },
+      deps.degradedModeService,
+    ),
+  );
+  app.register(
+    savedPoolsRoutes(
+      savedPoolsSvc,
+      requirePermission("own.data.write", [walletPrincipal]),
+    ),
+  );
   app.register(schemaVersionRoutes(schemaVersionSvc));
   app.register(
     internalRoutes(
@@ -464,6 +506,9 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     ),
   );
   app.register(reconciliationRoutes(deps.prisma, deps.internalSecret));
+  if (deps.cacheService) {
+    app.register(cacheRepairRoutes(deps.cacheService, deps.internalSecret));
+  }
   app.register(
     operationalHealthRoutes(operationalHealthSvc, deps.internalSecret),
   );
@@ -577,7 +622,10 @@ export function buildApp(deps: AppDeps): FastifyInstance {
         enforceOperationLimit(operationLimits, "recovery.retry"),
       ),
       adminRead: requirePermission("admin.recovery.read", [walletPrincipal]),
-      adminWrite: requirePermission("admin.recovery.write", [walletPrincipal]),
+      adminWrite: chainPreHandlers(
+        requirePermission("admin.recovery.write", [walletPrincipal]),
+        requireMaintainerApproval("admin.recovery.write")
+      ),
     }),
   );
   app.register(
@@ -598,7 +646,10 @@ export function buildApp(deps: AppDeps): FastifyInstance {
   app.register(
     operationLimitsRoutes(operationLimits, {
       read: requirePermission("admin.limits.read", [walletPrincipal]),
-      write: requirePermission("admin.limits.write", [walletPrincipal]),
+      write: chainPreHandlers(
+        requirePermission("admin.limits.write", [walletPrincipal]),
+        requireMaintainerApproval("admin.limits.write")
+      ),
     }),
   );
 
@@ -611,14 +662,53 @@ export function buildApp(deps: AppDeps): FastifyInstance {
   app.register(
     impersonationRoutes(impersonationSvc, {
       read: requirePermission("admin.impersonation.read", [walletPrincipal]),
-      write: requirePermission("admin.impersonation.write", [walletPrincipal]),
+      write: chainPreHandlers(
+        requirePermission("admin.impersonation.write", [walletPrincipal]),
+        requireMaintainerApproval("admin.impersonation.write")
+      ),
     }),
   );
 
   // #793: partial failure dashboard.
+  const maintainerNotes = new MaintainerNotesService(deps.prisma);
+  const failureEscalations = new FailureEscalationService(deps.prisma);
+  app.register(maintainerOperationsRoutes(maintainerNotes, failureEscalations, {
+    read: requirePermission("admin.recovery.read", [walletPrincipal]),
+    write: requirePermission("admin.recovery.write", [walletPrincipal]),
+  }));
+  let stopMaintainerOperations: (() => Promise<void>) | undefined;
+  app.addHook("onReady", async () => {
+    stopMaintainerOperations = startMaintainerOperations(maintainerNotes, failureEscalations,
+      (err) => app.log.error({ err }, "maintainer operations tick failed"));
+  });
+  app.addHook("onClose", async () => { await stopMaintainerOperations?.(); });
   const partialFailureSvc = new PartialFailureService(deps.prisma, auditTrail);
   app.register(
     partialFailureRoutes(partialFailureSvc, {
+      read: requirePermission("admin.recovery.read", [walletPrincipal]),
+      write: chainPreHandlers(
+        requirePermission("admin.recovery.write", [walletPrincipal]),
+        requireMaintainerApproval("admin.recovery.write")
+      ),
+    }),
+  );
+
+  // #989: versioned projection rebuild from the stored chain event log. Its
+  // LedgerService shares the live cache (checkpoint) but registers no
+  // onActionConfirmed callback: replay rebuilds projections, not side effects.
+  const projectionRebuildSvc = new ProjectionRebuildService({
+    runs: new PrismaProjectionRebuildStore(deps.prisma),
+    target: new PrismaProjectionTarget(deps.prisma, new LedgerService(deps.prisma, deps.cacheService), {
+      decoder: sorobanNativeXdrDecoder,
+      factoryAddress: deps.vaultFactoryAddress,
+      logger: loggerInstance,
+    }),
+    fence: new LeaseIndexerFence(new LeaseService(deps.prisma)),
+    audit: auditTrail,
+    logger: loggerInstance,
+  });
+  app.register(
+    projectionRebuildRoutes(projectionRebuildSvc, {
       read: requirePermission("admin.recovery.read", [walletPrincipal]),
       write: requirePermission("admin.recovery.write", [walletPrincipal]),
     }),
